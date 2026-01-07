@@ -1,0 +1,19 @@
+[info]
+relay_url = "ws://localhost:8080"
+name = "AntiGoogle Local Relay"
+description = "Internal swarm relay"
+pubkey = "0000000000000000000000000000000000000000000000000000000000000000"
+contact = "admin@localhost"
+
+[network]
+port = 8080
+address = "0.0.0.0"
+
+[options]
+reject_future_seconds = 1800 # 30 mins
+
+[limits]
+messages_per_sec = 1000
+max_event_size = 131072
+
+

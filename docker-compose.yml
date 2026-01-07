@@ -1,0 +1,115 @@
+services:
+  # PostgreSQL with pgvector
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: antigoogle
+      POSTGRES_PASSWORD: antigoogle
+      POSTGRES_DB: antigoogle
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U antigoogle"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Redis
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Web API
+  api:
+    build: .
+    command: uvicorn app.api:app --host 0.0.0.0 --port 8000
+    environment:
+      DATABASE_URL: postgresql+asyncpg://antigoogle:antigoogle@db:5432/antigoogle
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+      
+      # Nostr Configuration
+      NOSTR_ENABLED: ${NOSTR_ENABLED:-true}
+      NOSTR_PRIVATE_KEY: ${NOSTR_PRIVATE_KEY:-}  # Auto-generated if empty
+      NOSTR_RELAYS: '["ws://relay:8080","wss://relay.damus.io", "wss://nos.lol","wss://relay.primal.net","wss://relay.snort.social" ]'
+      NOSTR_TRUSTED_PUBKEYS: ${NOSTR_TRUSTED_PUBKEYS:-[]}
+      
+      # Swarm Settings
+      SWARM_PUBLISH_RESULTS: ${SWARM_PUBLISH_RESULTS:-true}
+      SWARM_PUBLISH_DISCOVERY: ${SWARM_PUBLISH_DISCOVERY:-true}
+      SWARM_ACCEPT_EXTERNAL: ${SWARM_ACCEPT_EXTERNAL:-true}
+      VRF_REDUNDANCY: ${VRF_REDUNDANCY:-2}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./wasm:/app/wasm
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      relay:
+        condition: service_started
+    restart: unless-stopped
+
+  # Celery Worker (Crawler)
+  crawler:
+    build: .
+    command: celery -A app.crawler worker --loglevel=info -Q crawler --concurrency=2
+    environment:
+      DATABASE_URL: postgresql+asyncpg://antigoogle:antigoogle@db:5432/antigoogle
+      REDIS_URL: redis://redis:6379/0
+      NOSTR_ENABLED: ${NOSTR_ENABLED:-true}
+      NOSTR_PRIVATE_KEY: ${NOSTR_PRIVATE_KEY:-}
+      NOSTR_RELAYS: '["ws://relay:8080","wss://relay.damus.io", "wss://nos.lol","wss://relay.primal.net","wss://relay.snort.social" ]'
+      NOSTR_TRUSTED_PUBKEYS: ${NOSTR_TRUSTED_PUBKEYS:-[]}
+      SWARM_PUBLISH_RESULTS: ${SWARM_PUBLISH_RESULTS:-true}
+      SWARM_PUBLISH_DISCOVERY: ${SWARM_PUBLISH_DISCOVERY:-true}
+      VRF_REDUNDANCY: ${VRF_REDUNDANCY:-2}
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      relay: 
+        condition: service_started
+    restart: unless-stopped
+
+  # Celery Beat (Scheduler)
+  beat:
+    build: .
+    command: celery -A app.crawler beat --loglevel=info
+    environment:
+      DATABASE_URL: postgresql+asyncpg://antigoogle:antigoogle@db:5432/antigoogle
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - crawler
+    restart: unless-stopped
+
+  relay:
+    image: scsibug/nostr-rs-relay:latest
+    ports:
+        - "8081:8080"
+    volumes:
+        - ./relay_config.toml:/usr/src/app/config.toml
+        - relaydata:/usr/src/app/db
+    restart: unless-stopped
+
+
+volumes:
+  pgdata:
+  redisdata:
+  relaydata:

@@ -1,0 +1,43 @@
+# --- Environment & Secrets (CRITICAL) ---
+.env
+.env.local
+# Keep the template
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+
+# --- Data & Persistent Storage ---
+# Ignore database/index files
+data/*
+# Keep the folder structure
+!data/.gitkeep
+
+# Specific sensitive/generated files
+data/swarm_config.json
+data/pca_model.pkl
+
+# --- Docker Volumes ---
+pgdata/
+redisdata/
+relaydata/
+
+# --- WASM / Rust ---
+# Ignore Rust build intermediates
+wasm/target/
+
+# Keep the 'pkg' folder so the app works out-of-the-box
+# !wasm/pkg/ 
+
+# --- IDE & OS ---
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+*.log

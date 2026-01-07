@@ -1,0 +1,17 @@
+{
+  "name": "antigoogle-wasm",
+  "type": "module",
+  "description": "Fast client-side vector operations for AntiGoogle",
+  "version": "0.1.0",
+  "license": "MIT",
+  "files": [
+    "antigoogle_wasm_bg.wasm",
+    "antigoogle_wasm.js",
+    "antigoogle_wasm.d.ts"
+  ],
+  "main": "antigoogle_wasm.js",
+  "types": "antigoogle_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
