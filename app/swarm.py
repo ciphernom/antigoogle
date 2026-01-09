@@ -13,7 +13,7 @@ import asyncio
 import hashlib
 import logging
 import secrets
-from typing import Optional
+from typing import Optional, List, Dict
 from collections import Counter
 from urllib.parse import urlparse
 from datetime import datetime
