@@ -19,6 +19,24 @@ settings = get_settings()
 class Base(DeclarativeBase):
     pass
 
+class TrustHash(Base):
+    """
+    Trust DAG nodes - stores the Merkle DAG of domain trust.
+    """
+    __tablename__ = "trust_hashes"
+    
+    domain: Mapped[str] = mapped_column(String(255), primary_key=True)
+    trust_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    parent_domains: Mapped[list] = mapped_column(ARRAY(String(255)), default=[])
+    parent_hashes: Mapped[list] = mapped_column(ARRAY(String(64)), default=[])
+    depth: Mapped[int] = mapped_column(Integer, default=0)
+    trust_score: Mapped[float] = mapped_column(Float, default=0.0)
+
+    __table_args__ = (
+        Index('ix_trust_hash_lookup', 'trust_hash'),
+        Index('ix_trust_depth', 'depth'),
+    )
+
 class Page(Base):
     """Indexed pages"""
     __tablename__ = "pages"

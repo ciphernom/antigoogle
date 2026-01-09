@@ -85,52 +85,76 @@ def verify_signature(event: dict) -> bool:
 # ============================================================
 @dataclass
 class URLDiscoveryEvent:
-    """Kind 4242: Request to crawl a URL"""
+    """Kind 4242: Request to crawl a URL with Trust Proof"""
     url: str
     domain: str
     priority: float
-    source_url: Optional[str] = None
-    pow_challenge: Optional[str] = None  # Anti-spam PoW challenge
-    pow_nonce: Optional[int] = None      # Anti-spam PoW solution
     
+    # Trust proof: list of nodes from target back to seeds
+    trust_proof: List[Dict] = field(default_factory=list)
+    # Hash of the trust proof (binds PoW to this specific proof)
+    proof_hash: str = ""
+    # PoW solution for the proof_hash
+    pow_nonce: Optional[int] = None
+    
+    # Legacy fields
+    source_url: Optional[str] = None
+    pow_challenge: Optional[str] = None 
+
     def to_content(self) -> str:
         return json.dumps(asdict(self))
     
     @classmethod
     def from_content(cls, content: str) -> 'URLDiscoveryEvent':
-        return cls(**json.loads(content))
+        data = json.loads(content)
+        data.setdefault('trust_proof', [])
+        data.setdefault('proof_hash', '')
+        return cls(**data)
 
 
 @dataclass
+class TrustProofNode:
+    """A node in a trust proof (for serialization over Nostr)"""
+    domain: str
+    trust_hash: str
+    parent_hashes: List[str]
+    depth: int
+    trust_score: float
+
+@dataclass
 class CrawlResultEvent:
-    """
-    Kind 4243: Crawled page metadata + Vector Embedding
-    """
+    """Kind 4243: Crawl Result with Trust Proof"""
     url: str
     url_hash: str
     title: str
-    description: str  # First 200 chars for re-embedding
+    description: str
     domain: str
     quality_score: float
     slop_score: float
     spam_score: float
     word_count: int
     tags: List[str]
+    
+    # Trust proof
+    trust_proof: List[Dict] = field(default_factory=list)
+    proof_hash: str = ""
+    
     embedding: Optional[List[float]] = None
     experts: Dict[str, float] = field(default_factory=dict)
     vrf_proof: Optional[str] = None
     
     def to_content(self) -> str:
-        # Truncate description to save bandwidth
         data = asdict(self)
         data['description'] = data['description'][:200]
         data['tags'] = data['tags'][:5]
-        # Embedding is now included automatically by asdict
         return json.dumps(data)
     
     @classmethod
     def from_content(cls, content: str) -> 'CrawlResultEvent':
-        return cls(**json.loads(content))
+        data = json.loads(content)
+        data.setdefault('trust_proof', [])
+        data.setdefault('proof_hash', '')
+        return cls(**data)
 
 
 @dataclass

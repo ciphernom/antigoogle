@@ -18,7 +18,7 @@ from collections import Counter
 from urllib.parse import urlparse
 from datetime import datetime
 from sqlalchemy import select, update,  func, text
-
+from .trust import get_trust_dag, merkle_root, sha256_hex
 from sqlalchemy.dialects.postgresql import insert
 
 from .config import get_settings, BLOCKED_DOMAINS, TRUSTED_DOMAINS
@@ -35,7 +35,76 @@ logger = logging.getLogger("swarm")
 
 
 # ============================================================
-# POW FUNCTIONS (same as api.py)
+# TRUST VERIFICATION HELPERS 
+# ============================================================
+
+def compute_trust_hash(domain: str, parent_hashes: List[str]) -> str:
+    root = merkle_root(parent_hashes)
+    data = domain.encode('utf-8') + bytes.fromhex(root)
+    return sha256_hex(data)
+
+def verify_proof_chain(proof_nodes: List[dict]) -> tuple[bool, str]:
+    for node in proof_nodes:
+        expected = compute_trust_hash(node['domain'], node['parent_hashes'])
+        if expected != node['trust_hash']:
+            return False, f"Invalid hash for {node['domain']}"
+    return True, "OK"
+
+def compute_proof_hash(proof_nodes: List[dict]) -> str:
+    if not proof_nodes: return hashlib.sha256(b"EMPTY").hexdigest()
+    data = proof_nodes[0].get('trust_hash', '').encode()
+    for node in proof_nodes:
+        data += node['trust_hash'].encode()
+    return hashlib.sha256(data).hexdigest()
+
+async def verify_trust_proof(trust_proof, proof_hash, pow_nonce, difficulty):
+    if not trust_proof: return False, 0.0, "Empty proof"
+    
+    # 1. PoW check (if required)
+    if difficulty > 0:
+        if pow_nonce is None or not verify_pow(proof_hash, pow_nonce, difficulty):
+            return False, 0.0, "Invalid PoW"
+    
+    # 2. Integrity check
+    if compute_proof_hash(trust_proof) != proof_hash:
+        return False, 0.0, "Proof hash mismatch"
+
+    # 3. Validity check
+    valid, reason = verify_proof_chain(trust_proof)
+    if not valid: return False, 0.0, reason
+
+    # 4. Intersection check
+    trust_dag = await get_trust_dag()
+    intersection_depth = -1
+    intersection_trust = 0.0
+    
+    for i, node in enumerate(trust_proof):
+        # Exact match
+        if trust_dag.knows_hash(node['trust_hash']):
+            local_node = trust_dag.get_node(node['domain'])
+            if local_node:
+                intersection_depth = i
+                intersection_trust = local_node.trust_score
+                break
+        # Domain match (partial trust)
+        elif trust_dag.has_trust(node['domain']):
+            local_node = trust_dag.get_node(node['domain'])
+            if local_node:
+                intersection_depth = i
+                intersection_trust = (local_node.trust_score * node['trust_score']) ** 0.5
+                break
+    
+    if intersection_depth < 0:
+        return False, 0.0, "No intersection"
+        
+    final_trust = intersection_trust * (trust_dag.TRUST_DECAY ** intersection_depth)
+    if final_trust < trust_dag.MIN_TRUST:
+        return False, final_trust, "Trust too low"
+        
+    return True, final_trust, "Valid"
+
+# ============================================================
+# POW FUNCTIONS 
 # ============================================================
 def fnv1a_hash(challenge: str, nonce: int) -> int:
     """FNV-1a hash matching client implementation"""
@@ -130,6 +199,15 @@ async def handle_url_discovery(event: dict):
     if domain in BLOCKED_DOMAINS:
         return
     
+    # === TRUST CHECK ===
+    is_valid, trust_score, reason = await verify_trust_proof(
+        content.trust_proof, content.proof_hash, content.pow_nonce, settings.SWARM_POW_DIFFICULTY
+    )
+    if not is_valid:
+        logger.debug(f"Rejected discovery {content.domain}: {reason}")
+        return
+    # ===================
+    
     # PoW verification
     if content.pow_challenge and content.pow_nonce is not None:
         if not verify_pow(content.pow_challenge, content.pow_nonce, settings.SWARM_POW_DIFFICULTY):
@@ -157,13 +235,12 @@ async def handle_url_discovery(event: dict):
         if result.scalar_one_or_none():
             return
         
-        trust = TRUSTED_DOMAINS.get(domain, 0.5)
-        priority = content.priority * trust
+        priority = content.priority * trust_score
         
         db.add(CrawlQueue(url=url, priority=priority))
         try:
             await db.commit()
-            logger.info(f"📥 Queued from swarm: {url[:60]}")
+            logger.info(f"📥 Queued {content.url[:50]} (Trust: {trust_score:.2f})")
         except Exception:
             await db.rollback()
 
@@ -192,6 +269,16 @@ async def handle_crawl_result(event: dict):
     
     if content.slop_score > settings.SLOP_THRESHOLD:
         return
+    
+    # === TRUST CHECK (No PoW required for results, just graph verification) ===
+    is_valid, trust_score, reason = await verify_trust_proof(
+        content.trust_proof, content.proof_hash, None, 0
+    )
+    if not is_valid:
+        logger.debug(f"Rejected result {content.domain}: {reason}")
+        return
+    # =========================================================================
+    
     
     async with async_session() as db:
         result = await db.execute(select(Page.id).where(Page.url_hash == content.url_hash))
@@ -407,98 +494,75 @@ class SwarmPublisher:
             'votes_published': 0,
         }
     
-    async def _make_pow(self) -> tuple[str, int]:
-        """Generate challenge and solve PoW without blocking event loop"""
-        challenge = secrets.token_hex(32)
-        # Run CPU-bound PoW in thread pool to avoid blocking
+    async def _make_pow_for_proof(self, proof_hash: str) -> int:
+        """Solve PoW for a proof hash"""
+        difficulty = settings.SWARM_POW_DIFFICULTY
         loop = asyncio.get_event_loop()
-        nonce = await loop.run_in_executor(None, solve_pow, challenge, settings.SWARM_POW_DIFFICULTY)
-        return challenge, nonce
-    
-    async def publish_discovery(self, url: str, priority: float = 0.5, source_url: str = None) -> bool:
-        if not settings.SWARM_PUBLISH_DISCOVERY:
-            return False
+        return await loop.run_in_executor(None, lambda: self._solve_pow_blocking(proof_hash, difficulty))
+
+    def _solve_pow_blocking(self, challenge, difficulty):
+        nonce = 0
+        while True:
+            if verify_pow(challenge, nonce, difficulty): return nonce
+            nonce += 1
+            if nonce > 100_000_000: raise RuntimeError("Timeout")
+
+    async def publish_discovery(self, url: str, priority: float, source_url: str = None, trust_proof: list = None, proof_hash: str = None):
+        if not settings.SWARM_PUBLISH_DISCOVERY or not trust_proof: return False
         
+        pow_nonce = await self._make_pow_for_proof(proof_hash)
         domain = urlparse(url).netloc.lower().replace('www.', '')
-        challenge, nonce = await self._make_pow()  # Now async
         
         event = URLDiscoveryEvent(
-            url=url,
-            domain=domain,
-            priority=priority,
-            source_url=source_url,
-            pow_challenge=challenge,
-            pow_nonce=nonce,
+            url=url, domain=domain, priority=priority, source_url=source_url,
+            trust_proof=trust_proof, proof_hash=proof_hash, pow_nonce=pow_nonce
         )
-        
         if await self.nostr.publish_discovery(event):
             self._stats['discoveries_published'] += 1
             return True
         return False
-    
-    async def publish_result(
-        self,
-        url: str,
-        title: str,
-        description: str,
-        quality_score: float,
-        slop_score: float,
-        spam_score: float,
-        word_count: int,
-        tags: list[str],
-        embedding: list[float] = None,
-        experts: dict = None,
-    ) -> bool:
-        """Publish crawl result to swarm (LIGHTWEIGHT - no embedding)."""
-        if not settings.SWARM_PUBLISH_RESULTS:
-            return False
-        
-        if quality_score < settings.SWARM_MIN_QUALITY_PUBLISH:
-            return False
+
+    async def publish_result(self, url, title, description, quality_score, slop_score, spam_score, word_count, tags, embedding=None, experts=None, trust_proof=None, proof_hash=None):
+        if not settings.SWARM_PUBLISH_RESULTS or not trust_proof: return False
         
         domain = urlparse(url).netloc.lower().replace('www.', '')
         url_hash = get_url_hash(url)
         
         lottery = get_lottery_manager()
         _, ticket = lottery.should_crawl(domain)
+        vrf_proof = ticket.vrf_proof.hex() if (ticket and ticket.vrf_proof) else None
         
         event = CrawlResultEvent(
-            url=url,
-            url_hash=url_hash,
-            title=title,
-            description=description[:200],  # Truncate for bandwidth
-            domain=domain,
-            quality_score=quality_score,
-            slop_score=slop_score,
-            spam_score=spam_score,
-            word_count=word_count,
-            tags=tags[:5],  # Max 5 tags
-            embedding=embedding,
-            experts=experts or {},
-            vrf_proof=ticket.vrf_proof.hex() if ticket.vrf_proof else None,
+            url=url, url_hash=url_hash, title=title, description=description,
+            domain=domain, quality_score=quality_score, slop_score=slop_score,
+            spam_score=spam_score, word_count=word_count, tags=tags,
+            embedding=embedding, experts=experts or {},
+            trust_proof=trust_proof, proof_hash=proof_hash,
+            vrf_proof=vrf_proof  
         )
-        
         if await self.nostr.publish_result(event):
             self._stats['results_published'] += 1
             logger.info(f"📤 Published: {title[:40]}")
             return True
         return False
-    
+
     async def publish_vote(self, url_hash: str, is_good: bool, cluster_id: int) -> bool:
-        challenge, nonce = await self._make_pow()  # Now async
-        
+        challenge, nonce = await self._make_pow()
         event = VoteSignalEvent(
-            url_hash=url_hash,
-            is_good=is_good,
-            cluster_id=cluster_id,
-            pow_challenge=challenge,
-            pow_nonce=nonce,
+            url_hash=url_hash, is_good=is_good, cluster_id=cluster_id,
+            pow_challenge=challenge, pow_nonce=nonce,
         )
-        
         if await self.nostr.publish_vote(event):
             self._stats['votes_published'] += 1
             return True
         return False
+
+    async def _make_pow(self) -> tuple[str, int]:
+        # Helper for votes (legacy PoW)
+        challenge = secrets.token_hex(32)
+        loop = asyncio.get_event_loop()
+        nonce = await loop.run_in_executor(None, solve_pow, challenge, settings.SWARM_POW_DIFFICULTY)
+        return challenge, nonce
     
     def get_stats(self) -> dict:
         return self._stats.copy()

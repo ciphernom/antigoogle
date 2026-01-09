@@ -12,7 +12,7 @@ import hashlib
 import re
 import json
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Set
 from urllib.parse import urlparse, urljoin
 from urllib.robotparser import RobotFileParser
 from collections import Counter
@@ -28,6 +28,7 @@ import redis.asyncio as redis
 from .config import get_settings, BLOCKED_DOMAINS, TRUSTED_DOMAINS
 from .database import async_session, Page, Vocabulary, CrawlQueue, DomainLink
 from .experts import council
+from .trust import get_trust_dag, save_trust_dag, TrustProof
 
 from .filters import (
     slop_detector, spam_filter, quality_analyzer,
@@ -138,6 +139,49 @@ def tokenize_content(text: str) -> List[str]:
     words = re.findall(r'\b[a-z0-9]+\b', text.lower())
     return [w for w in words if w not in STOPWORDS and len(w) > 2]
 
+async def push_to_swarm_with_trust(action: str, data: dict, domain: str):
+    """
+    Push to swarm outbox with cryptographic trust proof.
+    """
+    from .trust import get_trust_dag
+    import json
+    import redis.asyncio as redis
+    
+    if not settings.NOSTR_ENABLED:
+        return
+
+    trust_dag = await get_trust_dag()
+    
+    # 1. Generate Proof
+    proof = trust_dag.generate_proof(domain)
+    
+    if proof is None:
+        print(f"⚠️ No trust proof for {domain}, not publishing to swarm")
+        return
+
+    # 2. Attach Proof to Payload
+    # Convert TrustNode objects to dicts for JSON serialization
+    data['trust_proof'] = [
+        {
+            'domain': node.domain,
+            'trust_hash': node.trust_hash,
+            'parent_hashes': node.parent_hashes,
+            'depth': node.depth,
+            'trust_score': node.trust_score,
+        }
+        for node in proof.path
+    ]
+    data['proof_hash'] = proof.chain_hash()
+    
+    # 3. Push to Redis
+    try:
+        r = redis.from_url(settings.REDIS_URL)
+        payload = json.dumps({'action': action, 'data': data})
+        await r.lpush('swarm_outbox', payload)
+        await r.close()
+    except Exception as e:
+        print(f"⚠️ Failed to push to swarm outbox: {e}")
+
 async def push_to_swarm_outbox(action: str, data: dict):
     """Push payload to Redis for API to publish"""
     if not settings.NOSTR_ENABLED:
@@ -214,6 +258,19 @@ async def crawl_url(url: str, source_trust: float = 0.5) -> Optional[Dict]:
         root = f"{parts[-2]}.{parts[-1]}"
         if root in BLOCKED_DOMAINS:
             return None
+    
+    trust_dag = await get_trust_dag()
+    
+    if not trust_dag.has_trust(domain):
+        # This domain has no trust path from seeds
+        # This is the key protection against illegal content
+        print(f"🚫 No trust path: {domain}")
+        return None
+    
+    trust_score = trust_dag.get_trust_score(domain)
+    if trust_score < trust_dag.MIN_TRUST:
+        print(f"🚫 Trust too low ({trust_score:.3f}): {domain}")
+        return None
     
     # VRF Lottery check - only crawl if we won this domain
     should_crawl, lottery_ticket = await check_domain_lottery(domain)
@@ -332,7 +389,7 @@ async def crawl_url(url: str, source_trust: float = 0.5) -> Optional[Dict]:
                 quality_score=quality_score,
                 slop_score=slop_score,
                 spam_score=spam_score,
-                domain_trust=metrics['domain_trust'],
+                domain_trust=trust_score, 
                 content_length=len(text),
                 word_count=word_count,
                 embedding=embedding.tolist(),
@@ -382,7 +439,7 @@ async def crawl_url(url: str, source_trust: float = 0.5) -> Optional[Dict]:
             # QUEUE FOR SWARM (Outbox Pattern)
             # ============================================================
             if quality_score >= settings.SWARM_MIN_QUALITY_PUBLISH and settings.SWARM_PUBLISH_RESULTS:
-                await push_to_swarm_outbox('result', {
+                await push_to_swarm_with_trust('result', {
                     'url': url,
                     'title': title,
                     'description': desc,
@@ -393,79 +450,89 @@ async def crawl_url(url: str, source_trust: float = 0.5) -> Optional[Dict]:
                     'tags': tags,
                     'experts': expert_data,
                     'embedding': embedding.tolist(),
-                })
+                }, domain)
             
             # ============================================================
-            # OUTLINK DISCOVERY
+            # OUTLINK DISCOVERY + TRUST DAG BUILDING
             # ============================================================
             link_priority = quality_score * source_trust
             queued = 0
             discovered_urls = []
-            seen_link_domains = set()  # For domain_links dedup within this page
+            seen_link_domains: Set[str] = set()
             
             for a in soup.find_all('a', href=True)[:settings.MAX_OUTLINKS]:
                 href = a.get('href', '')
-                if href.startswith('http'):
+                if not href.startswith('http'):
+                    continue
                     
-                    link_domain = urlparse(href).netloc.lower().replace('www.', '')
-                    
-                    if link_domain in BLOCKED_DOMAINS: 
-                        continue
-                    parts = link_domain.split('.')
-                    if len(parts) > 2 and f"{parts[-2]}.{parts[-1]}" in BLOCKED_DOMAINS:
-                        continue
-                    
-                    if link_domain not in BLOCKED_DOMAINS:
-                        link_trust = TRUSTED_DOMAINS.get(link_domain, 0.5)
-                        link_hash = get_url_hash(href)
+                link_domain = urlparse(href).netloc.lower().replace('www.', '')
+                
+                # Blocklist check
+                if link_domain in BLOCKED_DOMAINS: 
+                    continue
+                parts = link_domain.split('.')
+                if len(parts) > 2 and f"{parts[-2]}.{parts[-1]}" in BLOCKED_DOMAINS:
+                    continue
+                
+                # Skip if already seen this domain on this page
+                if link_domain in seen_link_domains:
+                    continue
+                seen_link_domains.add(link_domain)
                         
-                        # ============================================================
-                        # TRACK DOMAIN-TO-DOMAIN LINKS (for topology analysis)
-                        # ============================================================
-                        if link_domain != domain and link_domain not in seen_link_domains:
-                            seen_link_domains.add(link_domain)
-                            try:
-                                # Upsert domain link
-                                link_stmt = insert(DomainLink).values(
-                                    source=domain,
-                                    target=link_domain,
-                                    link_count=1
-                                ).on_conflict_do_update(
-                                    constraint='uq_domain_link',
-                                    set_={'link_count': DomainLink.link_count + 1}
-                                )
-                                await db.execute(link_stmt)
-                            except Exception:
-                                pass  # Non-critical
-                        
-                        # Check if not already indexed
-                        exists = await db.execute(
-                            select(Page.id).where(Page.url_hash == link_hash)
+                # ============================================================
+                # BUILD TRUST DAG - This is the key addition
+                # ============================================================
+                trust_node = await trust_dag.add_domain_async(link_domain, [domain], db)
+                
+                if trust_node is None:
+                    # No trust path (source domain untrusted or too deep)
+                    continue
+                
+                # ============================================================
+                # TRACK DOMAIN LINKS (for topology analysis)
+                # ============================================================
+                if link_domain != domain:
+                    try:
+                        link_stmt = insert(DomainLink).values(
+                            source=domain,
+                            target=link_domain,
+                            link_count=1
+                        ).on_conflict_do_update(
+                            constraint='uq_domain_link',
+                            set_={'link_count': DomainLink.link_count + 1}
                         )
-                        if not exists.scalar_one_or_none():
-                            normalized_href = normalize_url(href)
-                            final_priority = link_priority * link_trust
-                            
-                            # Add to local queue
-                            queue_item = CrawlQueue(
-                                url=normalized_href,
-                                priority=final_priority,
-                                source_page_id=page.id
-                            )
-                            # --- START FIX ---
-                            try:
-                                # Create a savepoint to isolate this insert
-                                async with db.begin_nested():
-                                    db.add(queue_item)
-                                    await db.flush() # Force SQL execution immediately
-                                queued += 1
-                                discovered_urls.append((normalized_href, final_priority))
-                            except IntegrityError:
-                                # If it fails, it rolls back to the savepoint automatically
-                                pass  # Duplicate URL, ignore safely
-                            except Exception:
-                                pass
-                            # --- END FIX ---
+                        await db.execute(link_stmt)
+                    except Exception:
+                        pass
+                
+                # ============================================================
+                # QUEUE URL IF TRUSTED
+                # ============================================================
+                link_hash = get_url_hash(href)
+                exists = await db.execute(
+                    select(Page.id).where(Page.url_hash == link_hash)
+                )
+                if exists.scalar_one_or_none():
+                    continue
+                
+                normalized_href = normalize_url(href)
+                # Priority now uses trust score from DAG
+                final_priority = quality_score * trust_node.trust_score
+                
+                try:
+                    async with db.begin_nested():
+                        db.add(CrawlQueue(
+                            url=normalized_href,
+                            priority=final_priority,
+                            source_page_id=page.id
+                        ))
+                        await db.flush()
+                    queued += 1
+                    discovered_urls.append((normalized_href, final_priority))
+                except IntegrityError:
+                    pass
+                except Exception:
+                    pass
             
             await db.commit()
             
@@ -473,11 +540,14 @@ async def crawl_url(url: str, source_trust: float = 0.5) -> Optional[Dict]:
             if settings.SWARM_PUBLISH_DISCOVERY:
                 for disc_url, disc_priority in discovered_urls:
                     if disc_priority >= 0.6:
-                        await push_to_swarm_outbox('discovery', {
+                        # Extract domain from the discovered URL
+                        disc_domain = urlparse(disc_url).netloc.lower().replace('www.', '')
+                        
+                        await push_to_swarm_with_trust('discovery', {
                             'url': disc_url,
                             'priority': disc_priority,
                             'source_url': url
-                        })
+                        }, disc_domain)
             
             swarm_indicator = "[s]" if settings.NOSTR_ENABLED else ""
             print(f"✅ Q:{quality_score:.2f} S:{slop_score:.2f} +{queued} {swarm_indicator} | {title[:50]}")
@@ -553,7 +623,7 @@ async def process_queue(batch_size: int = None) -> Dict:
         avg_quality = await db.scalar(select(func.avg(Page.quality_score))) or 0
     
     print(f"📊 {total_pages} pages | Avg quality: {avg_quality:.0%} | Queue: {queue_size}")
-    
+    await save_trust_dag()
     return {
         'processed': len(urls),
         'success': success,
@@ -729,11 +799,18 @@ async def seed_queue() -> int:
         if count > 0:
             return 0
         
+        trust_dag = await get_trust_dag()
+        for url, priority in seeds:
+            domain = urlparse(url).netloc.lower().replace('www.', '')
+            trust_dag.add_seed(domain)
+        
         for url, priority in seeds:
             db.add(CrawlQueue(url=url, priority=priority))
         
         try:
             await db.commit()
+            # ADD THIS: Save trust DAG after seeding
+            await save_trust_dag()
             return len(seeds)
         except IntegrityError:
             await db.rollback()
@@ -766,7 +843,18 @@ celery_app.conf.beat_schedule['cleanup-lottery-hourly'] = {
     'task': 'crawler.cleanup_lottery',
     'schedule': 3600.0,  # Every hour
 }
+# ============================================================
+# TRUST DAG PERSISTENCE
+# ============================================================
+@celery_app.task(name='crawler.save_trust_dag')
+def save_trust_dag_task():
+    """Persist trust DAG to database"""
+    return asyncio.get_event_loop().run_until_complete(save_trust_dag())
 
+celery_app.conf.beat_schedule['save-trust-dag-hourly'] = {
+    'task': 'crawler.save_trust_dag',
+    'schedule': 3600.0,
+}
 
 # ============================================================
 # TOPOLOGY BOOST (Indie Web Support)

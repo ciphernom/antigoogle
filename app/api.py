@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 import redis.asyncio as redis
-
+from .trust import get_trust_dag
 from .config import get_settings
 from .database import (
     init_db, get_db, async_session,
@@ -113,13 +113,17 @@ async def process_swarm_outbox():
                             word_count=d['word_count'],
                             tags=d['tags'],
                             embedding=d.get('embedding'),
-                            experts=d.get('experts')
+                            experts=d.get('experts'),
+                            trust_proof=d.get('trust_proof'),
+                            proof_hash=d.get('proof_hash')
                         )
                     elif action == 'discovery':
                         await pub.publish_discovery(
                             url=d['url'],
                             priority=d['priority'],
-                            source_url=d['source_url']
+                            source_url=d['source_url'],
+                            trust_proof=d.get('trust_proof'),
+                            proof_hash=d.get('proof_hash')
                         )
                 finally:
                     # ALWAYS restore full connection list
@@ -234,6 +238,10 @@ async def lifespan(app: FastAPI):
         vocab_data = {row.word: row.doc_count for row in result.fetchall()}
         spell_checker.load_vocab(vocab_data)
     # ----------------------   
+    
+    print("🌳 Initializing Trust DAG...")
+    trust_dag = await get_trust_dag()
+    print(f"✅ Trust DAG ready: {trust_dag.get_stats()}")
     
     yield
     
