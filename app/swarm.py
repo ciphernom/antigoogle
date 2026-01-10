@@ -328,7 +328,7 @@ async def handle_crawl_result(event: dict):
             domain_trust=TRUSTED_DOMAINS.get(domain, 0.5),
             content_length=0,
             word_count=content.word_count,
-            embedding=embedding.tolist(), # Convert numpy to list for pgvector
+            embedding=embedding if isinstance(embedding, list) else embedding.tolist(),
             tags=','.join(content.tags),
         )
         db.add(page)
